@@ -11,6 +11,9 @@
 - 支持基于白名单的用户访问控制
 - 支持配置文件和环境变量（环境变量优先）
 - 支持运行日志，便于排障
+- 支持多模态输入（文本、图片、文档/音视频附件）
+- 支持 Telegram `voice`/`audio` 的本地语音转写
+- 支持 `[[send_file:路径]]` / `[[send_photo:路径]]` 输出标记自动发文件
 
 ## 目录结构
 
@@ -52,6 +55,19 @@
 - `codex_model`：当前模型名；为空时使用 Codex 默认值
 - `codex_models`：`/models` 展示的候选模型列表（可选）
 - `log_file`：日志文件路径（相对路径基于项目根目录）
+- `media_input_enabled`：是否开启 Telegram 媒体输入下载与处理
+- `media_input_dir`：媒体落盘目录（用于后续会话引用）
+- `media_input_max_bytes`：单个媒体最大字节数
+- `media_input_max_files`：单条消息最多处理的附件数
+- `local_transcribe_enabled`：是否开启 `voice`/`audio` 本地转写
+- `local_transcribe_model`：本地转写模型（如 `tiny`、`base`）
+- `local_transcribe_language`：转写语言（如 `zh`、`en`；留空表示自动）
+
+如需本地转写，请先安装依赖：
+
+```bash
+python -m pip install faster-whisper
+```
 
 ## 白名单
 

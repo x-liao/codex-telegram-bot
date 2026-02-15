@@ -6,3 +6,5 @@ telegram/update-offset*.json
 __pycache__/
 *.pyc
 *.pyo
+telegram/uploads/
+workdir/

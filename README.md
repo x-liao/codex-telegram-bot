@@ -11,6 +11,9 @@ It receives messages through Telegram long polling (`getUpdates`), calls local `
 - Supports allowlist-based user access control
 - Supports config file and environment variables (environment variables take precedence)
 - Supports runtime logs for troubleshooting
+- Supports multimodal input (text, images, document/audio/video attachments)
+- Supports local speech transcription for Telegram `voice`/`audio` messages
+- Supports automatic file sending from reply markers: `[[send_file:path]]` / `[[send_photo:path]]`
 
 ## Directory Structure
 
@@ -52,6 +55,19 @@ Notes:
 - `codex_model`: Current model name; if empty, Codex default is used
 - `codex_models`: Optional candidate models shown by `/models`
 - `log_file`: Log file path (relative paths are based on project root)
+- `media_input_enabled`: Enable Telegram media download and processing
+- `media_input_dir`: Local directory for downloaded media
+- `media_input_max_bytes`: Max bytes per media file
+- `media_input_max_files`: Max media files to process per message
+- `local_transcribe_enabled`: Enable local transcription for `voice`/`audio`
+- `local_transcribe_model`: Local transcription model size/name (e.g. `tiny`, `base`)
+- `local_transcribe_language`: Preferred language code (e.g. `zh`, `en`; empty for auto)
+
+For local transcription, install dependency first:
+
+```bash
+python -m pip install faster-whisper
+```
 
 ## Allowlist
 

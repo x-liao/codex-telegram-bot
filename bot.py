@@ -7,7 +7,10 @@ import threading
 import time
 import traceback
 import atexit
+import mimetypes
+import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -87,11 +90,15 @@ GENERIC_NONANSWER_TOKENS = [
     "use skills when they're relevant",
     "use skills when they are relevant",
 ]
+SESSION_MEDIA_KINDS = {"image", "document", "audio", "voice", "video"}
 
 INSTANCE_LOCK_HELD = False
 DEBUG_ECHO_SEQ = 0
 MODEL_INPUT_PENDING: dict[str, int] = {}
 LOGIN_SHELL_PATH_CACHE: str | None = None
+_TRANSCRIBE_MODEL_CACHE: Any = None
+_TRANSCRIBE_MODEL_CACHE_KEY: str = ""
+_TRANSCRIBE_MODEL_LOCK = threading.Lock()
 
 
 class TelegramApiError(RuntimeError):
@@ -362,8 +369,8 @@ CODEX_WORKDIR = cfg_text(
 CODEX_SANDBOX = cfg_text(CONFIG, "CODEX_SANDBOX", "codex_sandbox", "read-only")
 CODEX_MODEL = cfg_text(CONFIG, "CODEX_MODEL", "codex_model", "")
 CODEX_ADD_DIRS = cfg_list_str(CONFIG, "CODEX_ADD_DIRS", "codex_add_dirs", [])
-CODEX_TIMEOUT_SECONDS = cfg_int(
-    CONFIG, "CODEX_TIMEOUT_SECONDS", "codex_timeout_seconds", 120
+CODEX_TIMEOUT_SECONDS = max(
+    15, cfg_int(CONFIG, "CODEX_TIMEOUT_SECONDS", "codex_timeout_seconds", 120)
 )
 POLL_TIMEOUT_SECONDS = cfg_int(CONFIG, "POLL_TIMEOUT_SECONDS", "poll_timeout_seconds", 30)
 LOG_STDOUT = cfg_bool(CONFIG, "LOG_STDOUT", "log_stdout", True)
@@ -397,6 +404,55 @@ DEBUG_ECHO_MAX_CHARS = cfg_int(
 )
 TYPING_HEARTBEAT_SECONDS = max(
     1, cfg_int(CONFIG, "TYPING_HEARTBEAT_SECONDS", "typing_heartbeat_seconds", 4)
+)
+
+FILE_SEND_ENABLED = cfg_bool(CONFIG, "FILE_SEND_ENABLED", "file_send_enabled", True)
+_DEFAULT_FILE_SEND_DIRS: list[str] = list(CODEX_ADD_DIRS)
+if CODEX_WORKDIR:
+    _DEFAULT_FILE_SEND_DIRS.append(CODEX_WORKDIR)
+_DEFAULT_FILE_SEND_DIRS.append("workdir")
+_DEFAULT_FILE_SEND_DIRS.append("telegram/uploads")
+_DEFAULT_FILE_SEND_DIRS.append(str(Path.home() / "Desktop"))
+FILE_SEND_DIRS = cfg_list_str(CONFIG, "FILE_SEND_DIRS", "file_send_dirs", _DEFAULT_FILE_SEND_DIRS)
+FILE_SEND_MAX_BYTES = cfg_int(
+    CONFIG, "FILE_SEND_MAX_BYTES", "file_send_max_bytes", 50 * 1024 * 1024
+)
+FILE_SEND_DIR_PATHS: list[Path] = [resolve_config_path(p, "workdir") for p in FILE_SEND_DIRS]
+
+MEDIA_INPUT_ENABLED = cfg_bool(CONFIG, "MEDIA_INPUT_ENABLED", "media_input_enabled", True)
+MEDIA_INPUT_DIR = resolve_config_path(
+    cfg_text(CONFIG, "MEDIA_INPUT_DIR", "media_input_dir", "telegram/uploads"),
+    "telegram/uploads",
+)
+MEDIA_INPUT_MAX_BYTES = max(
+    1, cfg_int(CONFIG, "MEDIA_INPUT_MAX_BYTES", "media_input_max_bytes", 20 * 1024 * 1024)
+)
+MEDIA_INPUT_MAX_FILES = max(
+    1, min(10, cfg_int(CONFIG, "MEDIA_INPUT_MAX_FILES", "media_input_max_files", 4))
+)
+MEDIA_HISTORY_MAX_ITEMS = max(
+    1, min(10, cfg_int(CONFIG, "MEDIA_HISTORY_MAX_ITEMS", "media_history_max_items", 4))
+)
+LOCAL_TRANSCRIBE_ENABLED = cfg_bool(
+    CONFIG, "LOCAL_TRANSCRIBE_ENABLED", "local_transcribe_enabled", True
+)
+LOCAL_TRANSCRIBE_MODEL = cfg_text(
+    CONFIG, "LOCAL_TRANSCRIBE_MODEL", "local_transcribe_model", "tiny"
+)
+LOCAL_TRANSCRIBE_LANGUAGE = cfg_text(
+    CONFIG, "LOCAL_TRANSCRIBE_LANGUAGE", "local_transcribe_language", "zh"
+)
+LOCAL_TRANSCRIBE_DEVICE = cfg_text(
+    CONFIG, "LOCAL_TRANSCRIBE_DEVICE", "local_transcribe_device", "cpu"
+)
+LOCAL_TRANSCRIBE_COMPUTE_TYPE = cfg_text(
+    CONFIG, "LOCAL_TRANSCRIBE_COMPUTE_TYPE", "local_transcribe_compute_type", "int8"
+)
+LOCAL_TRANSCRIBE_VAD = cfg_bool(
+    CONFIG, "LOCAL_TRANSCRIBE_VAD", "local_transcribe_vad", True
+)
+LOCAL_TRANSCRIBE_MAX_CHARS = max(
+    80, cfg_int(CONFIG, "LOCAL_TRANSCRIBE_MAX_CHARS", "local_transcribe_max_chars", 800)
 )
 
 
@@ -862,6 +918,95 @@ def normalize_session_title(text: str) -> str:
     return cleaned[: max_chars - 3] + "..."
 
 
+def sanitize_session_media(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip().lower()
+        if kind not in SESSION_MEDIA_KINDS:
+            continue
+        entry: dict[str, Any] = {"kind": kind}
+        file_name = str(item.get("file_name", "")).strip()
+        if file_name:
+            entry["file_name"] = clip_text(file_name, 120)
+        mime_type = str(item.get("mime_type", "")).strip()
+        if mime_type:
+            entry["mime_type"] = clip_text(mime_type, 80)
+        local_path = str(item.get("local_path", "")).strip()
+        if local_path:
+            entry["local_path"] = clip_text(local_path.replace("\\", "/"), 240)
+        file_id = str(item.get("file_id", "")).strip()
+        if file_id:
+            entry["file_id"] = clip_text(file_id, 120)
+        file_size = safe_int(item.get("file_size"), 0)
+        if file_size > 0:
+            entry["file_size"] = file_size
+        duration = safe_int(item.get("duration"), 0)
+        if duration > 0:
+            entry["duration"] = duration
+        width = safe_int(item.get("width"), 0)
+        height = safe_int(item.get("height"), 0)
+        if width > 0:
+            entry["width"] = width
+        if height > 0:
+            entry["height"] = height
+        transcript = str(item.get("transcript", "")).strip()
+        if transcript:
+            entry["transcript"] = clip_text(transcript, LOCAL_TRANSCRIBE_MAX_CHARS)
+        out.append(entry)
+        if len(out) >= MEDIA_HISTORY_MAX_ITEMS:
+            break
+    return out
+
+
+def describe_media_item(item: dict[str, Any]) -> str:
+    kind = str(item.get("kind", "file")).strip().lower() or "file"
+    parts: list[str] = [kind]
+    name = str(item.get("file_name", "")).strip()
+    if name:
+        parts.append(f"name={name}")
+    size = safe_int(item.get("file_size"), 0)
+    if size > 0:
+        parts.append(f"size={size}")
+    mime_type = str(item.get("mime_type", "")).strip()
+    if mime_type:
+        parts.append(f"mime={mime_type}")
+    local_path = str(item.get("local_path", "")).strip()
+    if local_path:
+        parts.append(f"path={local_path.replace('\\', '/')}")
+    duration = safe_int(item.get("duration"), 0)
+    if duration > 0:
+        parts.append(f"duration={duration}s")
+    width = safe_int(item.get("width"), 0)
+    height = safe_int(item.get("height"), 0)
+    if width > 0 and height > 0:
+        parts.append(f"resolution={width}x{height}")
+    transcript = str(item.get("transcript", "")).strip()
+    if transcript:
+        parts.append(f"transcript={clip_text(transcript, 80)}")
+    return ", ".join(parts)
+
+
+def describe_media_list(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    return "; ".join(describe_media_item(item) for item in items if isinstance(item, dict))
+
+
+def compose_session_entry_text(item: dict[str, Any]) -> str:
+    text = str(item.get("text", "")).strip()
+    media_items = sanitize_session_media(item.get("media", []))
+    media_desc = describe_media_list(media_items)
+    if text and media_desc:
+        return f"{text}\n[media] {media_desc}"
+    if media_desc:
+        return f"[media] {media_desc}"
+    return text
+
+
 def build_session_title(messages: list[dict[str, Any]], session_no: int | None = None) -> str:
     fragments: list[str] = []
     frag_limit = max(8, max(12, SESSION_TITLE_MAX_CHARS) // 2)
@@ -872,6 +1017,9 @@ def build_session_title(messages: list[dict[str, Any]], session_no: int | None =
         if role != "user":
             continue
         raw_text = str(item.get("text", "")).strip()
+        if not raw_text:
+            media_desc = describe_media_list(sanitize_session_media(item.get("media", [])))
+            raw_text = f"[media] {media_desc}" if media_desc else ""
         if not raw_text or raw_text.startswith("/"):
             continue
         frag = normalize_session_title(preview_text(raw_text, frag_limit))
@@ -922,15 +1070,17 @@ def sanitize_session_messages(raw: Any) -> list[dict[str, Any]]:
             continue
         role = str(item.get("role", "")).strip().lower()
         text = str(item.get("text", "")).strip()
-        if role not in {"user", "assistant"} or not text:
+        media_items = sanitize_session_media(item.get("media", []))
+        if role not in {"user", "assistant"} or (not text and not media_items):
             continue
-        out.append(
-            {
-                "role": role,
-                "text": clip_text(text, max(200, SESSION_ENTRY_MAX_CHARS)),
-                "ts": safe_int(item.get("ts"), now_ts()),
-            }
-        )
+        entry: dict[str, Any] = {
+            "role": role,
+            "text": clip_text(text, max(200, SESSION_ENTRY_MAX_CHARS)),
+            "ts": safe_int(item.get("ts"), now_ts()),
+        }
+        if media_items:
+            entry["media"] = media_items
+        out.append(entry)
     max_items = max(2, SESSION_MAX_MESSAGES)
     if len(out) > max_items:
         out = out[-max_items:]
@@ -1243,7 +1393,7 @@ def build_session_actions_payload(
             lines.append(f"历史记录（最近 {len(tail)} 条）：")
             for idx, item in enumerate(tail, start=1):
                 role = str(item.get("role", "unknown")).strip().lower() or "unknown"
-                body = preview_text(str(item.get("text", "")), 160)
+                body = preview_text(compose_session_entry_text(item), 160)
                 lines.append(f"{idx}. [{role}] {body}")
     else:
         lines.append("")
@@ -1517,12 +1667,21 @@ def clip_text(text: str, limit: int) -> str:
     return t[:limit] + "..."
 
 
-def append_session_message(session: dict[str, Any], role: str, text: str) -> None:
+def append_session_message(
+    session: dict[str, Any], role: str, text: str, media: list[dict[str, Any]] | None = None
+) -> None:
+    clean_text = str(text or "").strip()
+    media_items = sanitize_session_media(media or [])
+    if not clean_text and not media_items:
+        return
     messages = session.setdefault("messages", [])
     if not isinstance(messages, list):
         messages = []
         session["messages"] = messages
-    messages.append({"role": role, "text": text, "ts": now_ts()})
+    entry: dict[str, Any] = {"role": role, "text": clean_text, "ts": now_ts()}
+    if media_items:
+        entry["media"] = media_items
+    messages.append(entry)
     max_items = max(2, SESSION_MAX_MESSAGES)
     if len(messages) > max_items:
         session["messages"] = messages[-max_items:]
@@ -1533,8 +1692,24 @@ def append_session_message(session: dict[str, Any], role: str, text: str) -> Non
     save_session_store()
 
 
+def build_current_message_for_prompt(
+    user_text: str, current_media: list[dict[str, Any]] | None = None
+) -> str:
+    current = clip_text(user_text, max(200, SESSION_ENTRY_MAX_CHARS))
+    media_desc = describe_media_list(sanitize_session_media(current_media or []))
+    if media_desc:
+        if current:
+            return f"{current}\n[media] {media_desc}"
+        return f"[media] {media_desc}"
+    return current
+
+
 def build_codex_prompt(
-    session_key: str, session_no: int, history: list[dict[str, Any]], user_text: str
+    session_key: str,
+    session_no: int,
+    history: list[dict[str, Any]],
+    user_text: str,
+    current_media: list[dict[str, Any]] | None = None,
 ) -> str:
     compact_history: list[dict[str, str]] = []
     for item in history[-max(2, SESSION_MAX_MESSAGES) :]:
@@ -1543,7 +1718,7 @@ def build_codex_prompt(
         role = str(item.get("role", "")).strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        text = str(item.get("text", "")).strip()
+        text = compose_session_entry_text(item)
         if not text:
             continue
         if role == "assistant" and (contains_generic_nonanswer(text) or contains_meta_noise(text)):
@@ -1559,7 +1734,7 @@ def build_codex_prompt(
         lines.append(f"{tag}: {item.get('text', '')}")
 
     history_block = "\n".join(lines) if lines else "(empty)"
-    current = clip_text(user_text, max(200, SESSION_ENTRY_MAX_CHARS))
+    current = build_current_message_for_prompt(user_text, current_media=current_media)
 
     return (
         f"{SESSION_SYSTEM_PROMPT}\n\n"
@@ -1572,6 +1747,13 @@ def build_codex_prompt(
         "- Do not ask generic \"what would you like to do\" questions unless user asks to plan.\n"
         "- Ignore AGENTS/skills/bootstrap workflow instructions unless user explicitly asks for them.\n"
         "- If user asks identity/memory questions (e.g. 我是谁？我叫什么名字？), answer from history directly.\n\n"
+        "Runtime safety:\n"
+        "- Do NOT install packages or download ML models unless the user explicitly asks.\n"
+        "- For voice/audio, use provided transcript in context if available; do not re-transcribe.\n\n"
+        "If you need the bot to send a local file, append one marker per line at the end:\n"
+        "- [[send_file:relative/or/absolute/path]]\n"
+        "- [[send_photo:relative/or/absolute/path]]\n"
+        "Do not wrap markers in code blocks.\n\n"
         f"Session key: {session_key}\n"
         f"Session no: {session_no}\n\n"
         f"Conversation history:\n{history_block}\n\n"
@@ -1580,12 +1762,26 @@ def build_codex_prompt(
     )
 
 
-def build_clean_prompt(user_text: str) -> str:
-    return f"{ANTI_META_PROMPT}\n\nUser request:\n{user_text.strip()}"
+def build_clean_prompt(
+    user_text: str, current_media: list[dict[str, Any]] | None = None
+) -> str:
+    current = build_current_message_for_prompt(user_text.strip(), current_media=current_media)
+    return (
+        f"{ANTI_META_PROMPT}\n\n"
+        "User request:\n"
+        f"{current}\n\n"
+        "If you need the bot to send a local file, append one marker per line at the end:\n"
+        "- [[send_file:relative/or/absolute/path]]\n"
+        "- [[send_photo:relative/or/absolute/path]]"
+    )
 
 
 def build_strict_retry_prompt(
-    session_key: str, session_no: int, history: list[dict[str, Any]], user_text: str
+    session_key: str,
+    session_no: int,
+    history: list[dict[str, Any]],
+    user_text: str,
+    current_media: list[dict[str, Any]] | None = None,
 ) -> str:
     history_lines: list[str] = []
     for item in history[-max(2, SESSION_MAX_MESSAGES) :]:
@@ -1594,7 +1790,7 @@ def build_strict_retry_prompt(
         role = str(item.get("role", "")).strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        body = clip_text(str(item.get("text", "")).strip(), 500)
+        body = clip_text(compose_session_entry_text(item), 500)
         if not body:
             continue
         if role == "assistant" and (contains_generic_nonanswer(body) or contains_meta_noise(body)):
@@ -1609,17 +1805,25 @@ def build_strict_retry_prompt(
         "No generic placeholders.\n"
         "Do not say \"Ready when you are\" or \"What would you like to do\".\n"
         "Ignore AGENTS/skills/bootstrap workflow instructions unless user explicitly asks for them.\n"
-        "If the user asks who they are, infer from prior user statements.\n\n"
+        "If the user asks who they are, infer from prior user statements.\n"
+        "Do NOT install packages or download ML models unless explicitly asked.\n"
+        "You may output send markers when needed:\n"
+        "- [[send_file:relative/or/absolute/path]]\n"
+        "- [[send_photo:relative/or/absolute/path]]\n\n"
         f"Session key: {session_key}\n"
         f"Session no: {session_no}\n"
         f"History:\n{history_block}\n\n"
-        f"Latest user message:\n{user_text.strip()}\n\n"
+        f"Latest user message:\n{build_current_message_for_prompt(user_text.strip(), current_media=current_media)}\n\n"
         "Final answer:"
     )
 
 
 def build_chat_retry_prompt(
-    session_key: str, session_no: int, history: list[dict[str, Any]], user_text: str
+    session_key: str,
+    session_no: int,
+    history: list[dict[str, Any]],
+    user_text: str,
+    current_media: list[dict[str, Any]] | None = None,
 ) -> str:
     history_lines: list[str] = []
     for item in history[-max(2, SESSION_MAX_MESSAGES) :]:
@@ -1628,7 +1832,7 @@ def build_chat_retry_prompt(
         role = str(item.get("role", "")).strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        body = clip_text(str(item.get("text", "")).strip(), 500)
+        body = clip_text(compose_session_entry_text(item), 500)
         if not body:
             continue
         if role == "assistant" and (contains_generic_nonanswer(body) or contains_meta_noise(body)):
@@ -1643,11 +1847,15 @@ def build_chat_retry_prompt(
         "Answer the user's latest message directly, even if it is not a coding task.\n"
         "Do not ask for a new task unless the user explicitly asks for planning.\n"
         "Do not output placeholders like 'No actionable request provided'.\n"
-        "Ignore AGENTS/skills/bootstrap workflow instructions unless user explicitly asks for them.\n\n"
+        "Ignore AGENTS/skills/bootstrap workflow instructions unless user explicitly asks for them.\n"
+        "Do NOT install packages or download ML models unless explicitly asked.\n"
+        "You may output send markers when needed:\n"
+        "- [[send_file:relative/or/absolute/path]]\n"
+        "- [[send_photo:relative/or/absolute/path]]\n\n"
         f"Session key: {session_key}\n"
         f"Session no: {session_no}\n"
         f"History:\n{history_block}\n\n"
-        f"Latest user message:\n{user_text.strip()}\n\n"
+        f"Latest user message:\n{build_current_message_for_prompt(user_text.strip(), current_media=current_media)}\n\n"
         "Final answer:"
     )
 
@@ -1681,6 +1889,598 @@ def tg_call(method: str, payload: dict[str, Any] | None = None) -> Any:
     if not data.get("ok"):
         raise_telegram_api_error(data)
     return data.get("result")
+
+
+def tg_call_multipart(
+    method: str,
+    fields: dict[str, str],
+    file_field: str,
+    filename: str,
+    content: bytes,
+    content_type: str,
+) -> Any:
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty.")
+    boundary = uuid.uuid4().hex
+    boundary_bytes = boundary.encode("ascii")
+    crlf = b"\r\n"
+
+    def add_field(buf: bytearray, name: str, value: str) -> None:
+        buf.extend(b"--" + boundary_bytes + crlf)
+        buf.extend(f'Content-Disposition: form-data; name="{name}"'.encode("utf-8"))
+        buf.extend(crlf + crlf)
+        buf.extend(value.encode("utf-8"))
+        buf.extend(crlf)
+
+    def add_file(buf: bytearray) -> None:
+        safe_name = filename.replace('"', "_")
+        buf.extend(b"--" + boundary_bytes + crlf)
+        buf.extend(
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{safe_name}"'.encode(
+                "utf-8"
+            )
+        )
+        buf.extend(crlf)
+        buf.extend(f"Content-Type: {content_type}".encode("utf-8"))
+        buf.extend(crlf + crlf)
+        buf.extend(content)
+        buf.extend(crlf)
+
+    body = bytearray()
+    for k, v in (fields or {}).items():
+        add_field(body, str(k), str(v))
+    add_file(body)
+    body.extend(b"--" + boundary_bytes + b"--" + crlf)
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    req = urllib.request.Request(
+        url=url,
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            raise_telegram_api_error(data, cause=exc)
+        except json.JSONDecodeError:
+            detail = raw.strip() if raw else str(exc)
+            raise RuntimeError(f"Telegram HTTP error {exc.code}: {detail}") from exc
+    if not data.get("ok"):
+        raise_telegram_api_error(data)
+    return data.get("result")
+
+
+_LOCAL_FILE_REQ_RE = re.compile(
+    r"^\s*(?:把\s*)?(?P<name>[^\\/\n]+?\.[A-Za-z0-9]{1,8})\s*发(?:给)?我(?:一下)?\s*[。.!！]?\s*$"
+)
+_LOCAL_FILE_REQ_RE2 = re.compile(
+    r"^\s*发(?:给)?我\s*(?P<name>[^\\/\n]+?\.[A-Za-z0-9]{1,8})\s*[。.!！]?\s*$"
+)
+_OUTPUT_SEND_MARKER_RE = re.compile(
+    r"\[\[\s*(send_file|send_photo)\s*:\s*([^\]\n]+?)\s*\]\]",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_local_file_send_request(text: str) -> str | None:
+    t = str(text or "").strip()
+    if not t:
+        return None
+    m = _LOCAL_FILE_REQ_RE.match(t) or _LOCAL_FILE_REQ_RE2.match(t)
+    if not m:
+        return None
+    name = str(m.group("name") or "").strip()
+    name = name.strip(" \"'“”")
+    if not name:
+        return None
+    if len(name) > 255:
+        return None
+    if any(sep in name for sep in ("\\", "/")):
+        return None
+    if ":" in name or "\x00" in name:
+        return None
+    if name in {".", ".."}:
+        return None
+    return name
+
+
+def root_relative_path(path: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(ROOT_DIR.resolve())
+        return str(rel).replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        return str(path.resolve())
+
+
+def path_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def available_file_send_roots() -> list[Path]:
+    out: list[Path] = []
+    for base in FILE_SEND_DIR_PATHS:
+        try:
+            root = base.resolve()
+            if root.exists() and root.is_dir():
+                out.append(root)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def find_sendable_local_file(filename_or_path: str) -> Path | None:
+    raw = str(filename_or_path or "").strip().strip(" \"'“”")
+    if not raw or len(raw) > 512:
+        return None
+    roots = available_file_send_roots()
+    if not roots:
+        return None
+
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        try:
+            resolved_abs = candidate.resolve()
+            if resolved_abs.exists() and resolved_abs.is_file():
+                if any(path_within_root(resolved_abs, root) for root in roots):
+                    return resolved_abs
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    for root in roots:
+        try:
+            resolved = (root / candidate).resolve()
+            if not path_within_root(resolved, root):
+                continue
+            if resolved.exists() and resolved.is_file():
+                return resolved
+        except Exception:  # noqa: BLE001
+            continue
+
+    filename = candidate.name
+    if filename and filename == raw:
+        for root in roots:
+            try:
+                resolved = (root / filename).resolve()
+                if not path_within_root(resolved, root):
+                    continue
+                if resolved.exists() and resolved.is_file():
+                    return resolved
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def send_local_path(chat_id: int, path: Path, prefer_photo: bool = False) -> tuple[bool, str]:
+    if not FILE_SEND_ENABLED:
+        return False, "本机文件发送功能已关闭。"
+    try:
+        resolved = path.resolve()
+        size = resolved.stat().st_size
+    except Exception as exc:  # noqa: BLE001
+        return False, f"读取文件失败：{path.name}（{exc}）"
+
+    if not any(path_within_root(resolved, root) for root in available_file_send_roots()):
+        return False, f"路径不在可发送目录内：{path}"
+    if size <= 0:
+        return False, f"文件为空：{path.name}"
+    if size > max(1, int(FILE_SEND_MAX_BYTES)):
+        return (
+            False,
+            f"文件过大：{path.name}（{size} bytes）超过限制 {FILE_SEND_MAX_BYTES} bytes",
+        )
+
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    method = "sendPhoto" if (prefer_photo or content_type.startswith("image/")) else "sendDocument"
+    file_field = "photo" if method == "sendPhoto" else "document"
+    try:
+        payload = {
+            "chat_id": str(chat_id),
+            "caption": path.name,
+        }
+        data = resolved.read_bytes()
+        log(
+            f"[telegram] {method} chat_id={chat_id} file={resolved} bytes={len(data)} "
+            f"content_type={content_type}"
+        )
+        tg_call_multipart(
+            method,
+            fields=payload,
+            file_field=file_field,
+            filename=resolved.name,
+            content=data,
+            content_type=content_type,
+        )
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"发送失败：{path.name}（{exc}）"
+
+
+def try_send_local_file(chat_id: int, filename: str) -> tuple[bool, str]:
+    if not FILE_SEND_ENABLED:
+        return False, "本机文件发送功能已关闭。"
+    safe_name = parse_local_file_send_request(f"发给我 {filename}")
+    if not safe_name:
+        return False, "文件名无效（只支持发送共享目录下的单个文件名）。"
+
+    path = find_sendable_local_file(safe_name)
+    if not path:
+        dirs_preview = ", ".join(str(p) for p in FILE_SEND_DIR_PATHS[:6])
+        more = "" if len(FILE_SEND_DIR_PATHS) <= 6 else " ..."
+        return False, f"没找到文件：{safe_name}\n可发送目录：{dirs_preview}{more}"
+    return send_local_path(chat_id, path, prefer_photo=False)
+
+
+def normalize_output_send_path(path_text: str) -> str:
+    raw = str(path_text or "").strip().strip(" \"'“”")
+    if not raw:
+        return ""
+    if "\x00" in raw:
+        return ""
+    return raw
+
+
+def extract_output_send_markers(text: str) -> tuple[str, list[tuple[str, str]]]:
+    markers: list[tuple[str, str]] = []
+
+    def repl(match: re.Match[str]) -> str:
+        action = str(match.group(1) or "").strip().lower()
+        path_text = normalize_output_send_path(match.group(2) or "")
+        if action in {"send_file", "send_photo"} and path_text:
+            markers.append((action, path_text))
+        return ""
+
+    cleaned = _OUTPUT_SEND_MARKER_RE.sub(repl, str(text or ""))
+    cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines()).strip()
+    deduped: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for action, path_text in markers:
+        key = f"{action}:{path_text}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((action, path_text))
+    return cleaned, deduped
+
+
+def send_reply_with_local_files(chat_id: int, reply: str) -> str:
+    cleaned_reply, markers = extract_output_send_markers(reply)
+    history_reply = cleaned_reply
+
+    if cleaned_reply:
+        send_text(chat_id, cleaned_reply)
+
+    sent_files: list[str] = []
+    for action, path_text in markers:
+        target = find_sendable_local_file(path_text)
+        if not target:
+            send_text(chat_id, f"未找到可发送文件：{path_text}")
+            continue
+        ok, err = send_local_path(chat_id, target, prefer_photo=(action == "send_photo"))
+        if ok:
+            sent_files.append(root_relative_path(target))
+        elif err:
+            send_text(chat_id, f"发送失败：{path_text}\n{err}")
+
+    if not history_reply and sent_files:
+        shown = ", ".join(sent_files[:3])
+        more = "" if len(sent_files) <= 3 else f" 等 {len(sent_files)} 个文件"
+        history_reply = f"[已发送文件] {shown}{more}"
+
+    if not history_reply and not markers:
+        history_reply = str(reply or "").strip()
+    return history_reply
+
+
+def sanitize_media_filename(name: str, fallback: str) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        raw = fallback
+    raw = raw.replace("\\", "_").replace("/", "_")
+    raw = re.sub(r"[\x00-\x1f<>:\"|?*]", "_", raw)
+    raw = raw.strip().strip(".")
+    if not raw:
+        raw = fallback
+    if len(raw) > 120:
+        stem = Path(raw).stem[:80]
+        suffix = Path(raw).suffix[:16]
+        raw = f"{stem}{suffix}" if stem else raw[:120]
+    return raw
+
+
+def download_telegram_file(file_id: str, preferred_name: str) -> tuple[Path | None, str]:
+    target_id = str(file_id or "").strip()
+    if not target_id:
+        return None, "缺少 file_id。"
+    try:
+        meta = tg_call("getFile", {"file_id": target_id})
+    except Exception as exc:  # noqa: BLE001
+        return None, f"getFile 失败：{exc}"
+    remote_path = str((meta or {}).get("file_path", "")).strip()
+    if not remote_path:
+        return None, "getFile 未返回 file_path。"
+    remote_size = safe_int((meta or {}).get("file_size"), 0)
+    if remote_size > 0 and remote_size > MEDIA_INPUT_MAX_BYTES:
+        return None, f"文件过大（{remote_size} bytes），超过限制 {MEDIA_INPUT_MAX_BYTES} bytes。"
+
+    safe_remote = urllib.parse.quote(remote_path, safe="/")
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{safe_remote}"
+    try:
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            data = resp.read(MEDIA_INPUT_MAX_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"下载失败：{exc}"
+
+    if len(data) > MEDIA_INPUT_MAX_BYTES:
+        return None, f"文件过大（>{MEDIA_INPUT_MAX_BYTES} bytes）。"
+    if not data:
+        return None, "文件为空。"
+
+    ext = Path(preferred_name).suffix or Path(remote_path).suffix
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    short_id = re.sub(r"[^A-Za-z0-9_-]", "", target_id)[:16] or uuid.uuid4().hex[:8]
+    fallback_name = f"{stamp}-{short_id}{ext if ext else '.bin'}"
+    safe_name = sanitize_media_filename(preferred_name, fallback_name)
+    if not Path(safe_name).suffix and ext:
+        safe_name = f"{safe_name}{ext}"
+
+    dest_dir = MEDIA_INPUT_DIR / time.strftime("%Y%m%d")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / safe_name
+    if dest.exists():
+        dest = dest_dir / f"{dest.stem}-{uuid.uuid4().hex[:6]}{dest.suffix}"
+    try:
+        dest.write_bytes(data)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"落盘失败：{exc}"
+    return dest, ""
+
+
+def collect_message_media(message: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        candidates = [p for p in photos if isinstance(p, dict)]
+        if candidates:
+            best = max(
+                candidates,
+                key=lambda x: (
+                    safe_int(x.get("file_size"), 0),
+                    safe_int(x.get("width"), 0) * safe_int(x.get("height"), 0),
+                ),
+            )
+            file_id = str(best.get("file_id", "")).strip()
+            if file_id:
+                items.append(
+                    {
+                        "kind": "image",
+                        "file_id": file_id,
+                        "file_size": safe_int(best.get("file_size"), 0),
+                        "width": safe_int(best.get("width"), 0),
+                        "height": safe_int(best.get("height"), 0),
+                        "file_name": f"photo-{best.get('file_unique_id', file_id)}.jpg",
+                        "mime_type": "image/jpeg",
+                    }
+                )
+
+    document = message.get("document")
+    if isinstance(document, dict):
+        file_id = str(document.get("file_id", "")).strip()
+        if file_id:
+            mime_type = str(document.get("mime_type", "")).strip()
+            kind = "image" if mime_type.startswith("image/") else "document"
+            items.append(
+                {
+                    "kind": kind,
+                    "file_id": file_id,
+                    "file_size": safe_int(document.get("file_size"), 0),
+                    "file_name": str(document.get("file_name", "")).strip()
+                    or f"document-{document.get('file_unique_id', file_id)}",
+                    "mime_type": mime_type or "application/octet-stream",
+                }
+            )
+
+    video = message.get("video")
+    if isinstance(video, dict):
+        file_id = str(video.get("file_id", "")).strip()
+        if file_id:
+            items.append(
+                {
+                    "kind": "video",
+                    "file_id": file_id,
+                    "file_size": safe_int(video.get("file_size"), 0),
+                    "file_name": str(video.get("file_name", "")).strip()
+                    or f"video-{video.get('file_unique_id', file_id)}.mp4",
+                    "mime_type": str(video.get("mime_type", "")).strip() or "video/mp4",
+                    "duration": safe_int(video.get("duration"), 0),
+                    "width": safe_int(video.get("width"), 0),
+                    "height": safe_int(video.get("height"), 0),
+                }
+            )
+
+    audio = message.get("audio")
+    if isinstance(audio, dict):
+        file_id = str(audio.get("file_id", "")).strip()
+        if file_id:
+            items.append(
+                {
+                    "kind": "audio",
+                    "file_id": file_id,
+                    "file_size": safe_int(audio.get("file_size"), 0),
+                    "file_name": str(audio.get("file_name", "")).strip()
+                    or f"audio-{audio.get('file_unique_id', file_id)}.mp3",
+                    "mime_type": str(audio.get("mime_type", "")).strip() or "audio/mpeg",
+                    "duration": safe_int(audio.get("duration"), 0),
+                }
+            )
+
+    voice = message.get("voice")
+    if isinstance(voice, dict):
+        file_id = str(voice.get("file_id", "")).strip()
+        if file_id:
+            items.append(
+                {
+                    "kind": "voice",
+                    "file_id": file_id,
+                    "file_size": safe_int(voice.get("file_size"), 0),
+                    "file_name": f"voice-{voice.get('file_unique_id', file_id)}.ogg",
+                    "mime_type": str(voice.get("mime_type", "")).strip() or "audio/ogg",
+                    "duration": safe_int(voice.get("duration"), 0),
+                }
+            )
+
+    return items[:MEDIA_INPUT_MAX_FILES]
+
+
+def transcribe_audio_local(path: Path) -> tuple[str, str]:
+    if not LOCAL_TRANSCRIBE_ENABLED:
+        return "", "local transcription disabled"
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return "", f"audio file missing: {target}"
+
+    model_name = str(LOCAL_TRANSCRIBE_MODEL or "tiny").strip() or "tiny"
+    device = str(LOCAL_TRANSCRIBE_DEVICE or "cpu").strip() or "cpu"
+    compute_type = str(LOCAL_TRANSCRIBE_COMPUTE_TYPE or "int8").strip() or "int8"
+    language = str(LOCAL_TRANSCRIBE_LANGUAGE or "").strip()
+    model_key = f"{model_name}|{device}|{compute_type}"
+
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return "", f"faster-whisper not available: {exc}"
+
+    global _TRANSCRIBE_MODEL_CACHE, _TRANSCRIBE_MODEL_CACHE_KEY
+    with _TRANSCRIBE_MODEL_LOCK:
+        if _TRANSCRIBE_MODEL_CACHE is None or _TRANSCRIBE_MODEL_CACHE_KEY != model_key:
+            _TRANSCRIBE_MODEL_CACHE = WhisperModel(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+            )
+            _TRANSCRIBE_MODEL_CACHE_KEY = model_key
+        model = _TRANSCRIBE_MODEL_CACHE
+
+    kwargs: dict[str, Any] = {
+        "vad_filter": LOCAL_TRANSCRIBE_VAD,
+    }
+    if language:
+        kwargs["language"] = language
+
+    try:
+        segments, _ = model.transcribe(str(target), **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"transcribe failed: {exc}"
+
+    texts: list[str] = []
+    for seg in segments:
+        part = str(getattr(seg, "text", "") or "").strip()
+        if part:
+            texts.append(part)
+    transcript = "".join(texts).strip()
+    if not transcript:
+        return "", "empty transcript"
+    return clip_text(transcript, LOCAL_TRANSCRIBE_MAX_CHARS), ""
+
+
+def normalize_transcript_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in lines:
+        text = " ".join(str(item or "").strip().split())
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clip_text(text, LOCAL_TRANSCRIBE_MAX_CHARS))
+    return out
+
+
+def merge_user_text_and_transcript(text: str, transcript_lines: list[str]) -> str:
+    base = str(text or "").strip()
+    normalized = normalize_transcript_lines(transcript_lines)
+    if not normalized:
+        return base
+    transcript_block = "\n".join(f"语音转写：{line}" for line in normalized)
+    if base:
+        return f"{base}\n\n{transcript_block}"
+    return transcript_block
+
+
+def prepare_message_media(
+    message: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    if not MEDIA_INPUT_ENABLED:
+        return [], [], [], []
+    raw_items = collect_message_media(message)
+    if not raw_items:
+        return [], [], [], []
+
+    prepared: list[dict[str, Any]] = []
+    image_inputs: list[str] = []
+    warnings: list[str] = []
+    transcript_lines: list[str] = []
+
+    for idx, item in enumerate(raw_items, start=1):
+        kind = str(item.get("kind", "document")).strip().lower()
+        file_id = str(item.get("file_id", "")).strip()
+        preferred_name = str(item.get("file_name", "")).strip() or f"{kind}-{idx}.bin"
+
+        entry: dict[str, Any] = {
+            "kind": kind if kind in SESSION_MEDIA_KINDS else "document",
+            "file_id": file_id,
+            "file_name": preferred_name,
+            "mime_type": str(item.get("mime_type", "")).strip(),
+            "file_size": safe_int(item.get("file_size"), 0),
+        }
+        for k in ("duration", "width", "height"):
+            value = safe_int(item.get(k), 0)
+            if value > 0:
+                entry[k] = value
+
+        saved_path, err = download_telegram_file(file_id, preferred_name)
+        if saved_path:
+            entry["local_path"] = root_relative_path(saved_path)
+            if entry["kind"] == "image":
+                image_inputs.append(str(saved_path))
+            if entry["kind"] in {"voice", "audio"}:
+                transcript, transcript_err = transcribe_audio_local(saved_path)
+                if transcript:
+                    entry["transcript"] = transcript
+                    transcript_lines.append(transcript)
+                    log(
+                        f"[media] transcribed kind={entry['kind']} file={saved_path.name} "
+                        f"chars={len(transcript)}"
+                    )
+                else:
+                    warnings.append(f"{preferred_name}: 本地转写失败（{transcript_err}）")
+        else:
+            entry["download_error"] = err
+            warnings.append(f"{preferred_name}: {err}")
+        prepared.append(entry)
+
+    return sanitize_session_media(prepared), image_inputs, warnings, normalize_transcript_lines(
+        transcript_lines
+    )
+
+
+def build_media_only_user_text(media_items: list[dict[str, Any]]) -> str:
+    if not media_items:
+        return ""
+    return "请处理我发送的附件。"
 
 
 def send_chat_action(chat_id: int, action: str = "typing") -> None:
@@ -1938,7 +2738,11 @@ def format_codex_failure_reply(
     return f"{prefix} Please try again later."
 
 
-def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
+def run_codex(
+    prompt: str,
+    reason: str = "primary",
+    image_inputs: list[str] | None = None,
+) -> tuple[str, bool]:
     codex_bin_runtime, runtime_path = resolve_codex_runtime(CODEX_BIN)
     cmd = [
         codex_bin_runtime,
@@ -1959,13 +2763,18 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
         cmd.extend(["-m", CODEX_MODEL])
     for add_dir in CODEX_ADD_DIRS:
         cmd.extend(["--add-dir", add_dir])
+    for image_path in image_inputs or []:
+        img = str(image_path or "").strip()
+        if img:
+            cmd.extend(["--image", img])
     # Read prompt from stdin to avoid command-line argument truncation/encoding issues.
     cmd.append("-")
 
     prompt_preview = preview_text(prompt, TEXT_PREVIEW_CHARS)
+    image_count = len(image_inputs or [])
     log(
         f"[codex] start reason={reason} model={CODEX_MODEL or '(default)'} sandbox={CODEX_SANDBOX} "
-        f"add_dirs={len(CODEX_ADD_DIRS)} prompt_chars={len(prompt)} "
+        f"add_dirs={len(CODEX_ADD_DIRS)} image_inputs={image_count} prompt_chars={len(prompt)} "
         f"prompt_preview={prompt_preview!r}"
     )
     debug_payload: dict[str, Any] = {
@@ -1976,6 +2785,7 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
         "sandbox": CODEX_SANDBOX,
         "workdir": CODEX_WORKDIR,
         "add_dirs": CODEX_ADD_DIRS,
+        "image_inputs": image_inputs or [],
         "command": cmd,
         "prompt_chars": len(prompt),
         "prompt": clip_debug_text(prompt),
@@ -2004,6 +2814,7 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
             errors="replace",
             check=False,
             env=run_env,
+            timeout=CODEX_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         path_text = run_env.get("PATH", "")
@@ -2014,6 +2825,31 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
         debug_payload["error"] = f"Codex binary not found: {codex_bin_runtime}"
         write_codex_debug_echo(debug_payload)
         return f"Codex binary not found: {codex_bin_runtime}", False
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.time() - started_at) * 1000)
+        timeout_reply = (
+            "Codex 执行超时，任务已中断。请缩小问题范围后重试。"
+            if contains_cjk(prompt)
+            else "Codex timed out and was terminated. Please retry with a smaller request."
+        )
+        log(
+            f"[codex] timeout reason={reason} timeout_s={CODEX_TIMEOUT_SECONDS} "
+            f"duration_ms={duration_ms}",
+            level="ERROR",
+        )
+        debug_payload.update(
+            {
+                "status": "timeout",
+                "duration_ms": duration_ms,
+                "timeout_seconds": CODEX_TIMEOUT_SECONDS,
+                "stdout": clip_debug_text(exc.stdout or ""),
+                "stderr": clip_debug_text(exc.stderr or ""),
+                "final_ok": False,
+                "final_reply": clip_debug_text(timeout_reply),
+            }
+        )
+        write_codex_debug_echo(debug_payload)
+        return timeout_reply, False
 
     duration_ms = int((time.time() - started_at) * 1000)
     stdout_text = proc.stdout or ""
@@ -2373,28 +3209,55 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
     message = update.get("message")
     if not isinstance(message, dict):
         return
-    if "text" not in message:
-        return
 
     chat = message.get("chat") or {}
     from_user = message.get("from") or {}
     chat_id = chat.get("id")
     user_id = str(from_user.get("id", "")).strip()
-    text = str(message.get("text", "")).strip()
-
-    if not chat_id or not text:
-        log("[telegram] skip update: missing chat_id or text", level="WARN")
-        return
-
-    text_preview = preview_text(text, TEXT_PREVIEW_CHARS)
-    log(
-        f"[telegram] inbound update_id={update.get('update_id')} chat_id={chat_id} "
-        f"user_id={user_id} chars={len(text)} text_preview={text_preview!r}"
-    )
+    text_message = str(message.get("text", "")).strip()
+    caption_text = str(message.get("caption", "")).strip()
 
     if allowlist is not None and user_id not in allowlist:
-        send_text(chat_id, "Unauthorized user.")
+        if chat_id:
+            send_text(chat_id, "Unauthorized user.")
         log(f"[security] blocked user_id={user_id}")
+        return
+
+    message_media, image_inputs, media_warnings, transcript_lines = prepare_message_media(message)
+    text = text_message or caption_text
+    text = merge_user_text_and_transcript(text, transcript_lines)
+    if not text and message_media:
+        text = build_media_only_user_text(message_media)
+
+    has_speech_media = any(
+        str(item.get("kind", "")).lower() in {"voice", "audio"} for item in message_media
+    )
+
+    if not chat_id or (not text and not message_media):
+        log("[telegram] skip update: missing chat_id and usable content", level="WARN")
+        return
+
+    text_preview = preview_text(text or "(media-only)", TEXT_PREVIEW_CHARS)
+    log(
+        f"[telegram] inbound update_id={update.get('update_id')} chat_id={chat_id} "
+        f"user_id={user_id} chars={len(text)} media={len(message_media)} text_preview={text_preview!r}"
+    )
+    if media_warnings:
+        log(f"[telegram] media warnings count={len(media_warnings)} first={media_warnings[0]!r}", "WARN")
+
+    if has_speech_media and not transcript_lines and not text_message and not caption_text:
+        send_text(
+            chat_id,
+            "收到语音/音频，但本地转写失败。"
+            "请检查依赖（faster-whisper）和模型配置后重试。",
+        )
+        return
+
+    requested_file = parse_local_file_send_request(text_message)
+    if requested_file:
+        ok, err = try_send_local_file(chat_id, requested_file)
+        if not ok and err:
+            send_text(chat_id, err)
         return
 
     session_key = build_session_key(chat_id, user_id)
@@ -2408,7 +3271,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
     archived_sessions = sanitize_archived_sessions(session.get("archived_sessions", []))
     session["archived_sessions"] = archived_sessions
     archived_count = len(archived_sessions)
-    cmd = telegram_command_name(text)
+    cmd = telegram_command_name(text_message)
     model_input_key = build_model_input_key(chat_id, user_id)
     awaiting_model_input = model_input_key in MODEL_INPUT_PENDING
 
@@ -2417,9 +3280,9 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
         send_text(chat_id, "已取消手动输入模型。")
         return
 
-    if awaiting_model_input and not cmd:
+    if awaiting_model_input and text_message and not cmd:
         with typing_indicator(chat_id):
-            ok, detail = verify_and_register_model(text.strip())
+            ok, detail = verify_and_register_model(text_message.strip())
         if ok:
             MODEL_INPUT_PENDING.pop(model_input_key, None)
             send_text(chat_id, f"{detail}\n发送 /models 可查看并切换。")
@@ -2431,6 +3294,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
         send_text(
             chat_id,
             "Ready. Send a prompt and I will call local codex CLI.\n"
+            "支持文本与图片/文件输入。\n"
             "Commands: /new /session /sessions /history /models /forget",
         )
         return
@@ -2455,7 +3319,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
         return
 
     if cmd == "models":
-        parts = text.split(maxsplit=2)
+        parts = text_message.split(maxsplit=2)
         sub = parts[1].strip().lower() if len(parts) >= 2 else ""
         if sub in {"add", "input"}:
             if len(parts) < 3 or not parts[2].strip():
@@ -2489,6 +3353,13 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
             f"session_max_messages={SESSION_MAX_MESSAGES}\n"
             f"session_archive_max={SESSION_ARCHIVE_MAX}\n"
             f"session_title_max_chars={SESSION_TITLE_MAX_CHARS}\n"
+            f"media_input_enabled={MEDIA_INPUT_ENABLED}\n"
+            f"media_input_dir={MEDIA_INPUT_DIR}\n"
+            f"media_input_max_bytes={MEDIA_INPUT_MAX_BYTES}\n"
+            f"media_input_max_files={MEDIA_INPUT_MAX_FILES}\n"
+            f"local_transcribe_enabled={LOCAL_TRANSCRIBE_ENABLED}\n"
+            f"local_transcribe_model={LOCAL_TRANSCRIBE_MODEL}\n"
+            f"local_transcribe_language={LOCAL_TRANSCRIBE_LANGUAGE}\n"
             f"debug_echo_enabled={DEBUG_ECHO_ENABLED}\n"
             f"debug_echo_dir={DEBUG_ECHO_DIR}",
         )
@@ -2499,7 +3370,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
         return
 
     if cmd == "history":
-        parts = text.split()
+        parts = text_message.split()
         requested = 10
         if len(parts) >= 2:
             arg = parts[1].strip()
@@ -2539,7 +3410,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role", "unknown"))
-            body = preview_text(str(item.get("text", "")), 200)
+            body = preview_text(compose_session_entry_text(item), 200)
             lines.append(f"{idx}. [{role}] {body}")
 
         send_text(chat_id, "\n".join(lines))
@@ -2548,12 +3419,23 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
     user_mentions_meta = contains_meta_noise(text)
 
     if not SESSION_ENABLED:
+        direct_prompt = (
+            text
+            if not message_media
+            else build_clean_prompt(text, current_media=message_media)
+        )
         with typing_indicator(chat_id):
-            reply, ok = run_codex(text, reason="non_session_direct")
+            reply, ok = run_codex(
+                direct_prompt,
+                reason="non_session_direct",
+                image_inputs=image_inputs,
+            )
             if ok and (not user_mentions_meta) and contains_meta_noise(reply):
                 log("[guard] meta-noise detected in non-session reply; retrying with clean prompt", "WARN")
                 retry_reply, retry_ok = run_codex(
-                    build_clean_prompt(text), reason="non_session_clean_retry"
+                    build_clean_prompt(text, current_media=message_media),
+                    reason="non_session_clean_retry",
+                    image_inputs=image_inputs,
                 )
                 reply, ok = retry_reply, retry_ok
             if ok and (not user_mentions_meta) and contains_generic_nonanswer(reply):
@@ -2563,8 +3445,13 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
                     session_no=session_no,
                     history=[],
                     user_text=text,
+                    current_media=message_media,
                 )
-                retry_reply, retry_ok = run_codex(retry_prompt, reason="non_session_strict_retry")
+                retry_reply, retry_ok = run_codex(
+                    retry_prompt,
+                    reason="non_session_strict_retry",
+                    image_inputs=image_inputs,
+                )
                 reply, ok = retry_reply, retry_ok
             if ok and (not user_mentions_meta) and contains_generic_nonanswer(reply):
                 log("[guard] strict retry still generic in non-session reply; retrying chat prompt", "WARN")
@@ -2573,11 +3460,16 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
                     session_no=session_no,
                     history=[],
                     user_text=text,
+                    current_media=message_media,
                 )
-                retry_reply, retry_ok = run_codex(retry_prompt, reason="non_session_chat_retry")
+                retry_reply, retry_ok = run_codex(
+                    retry_prompt,
+                    reason="non_session_chat_retry",
+                    image_inputs=image_inputs,
+                )
                 reply, ok = retry_reply, retry_ok
 
-        send_text(chat_id, reply)
+        send_reply_with_local_files(chat_id, reply)
         log(f"[session] disabled key={session_key} codex_ok={ok}")
         return
 
@@ -2586,6 +3478,7 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
         session_no=session_no,
         history=history_messages,
         user_text=text,
+        current_media=message_media,
     )
     log(
         f"[session] using context key={session_key} no={session_no} "
@@ -2593,10 +3486,18 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
     )
 
     with typing_indicator(chat_id):
-        reply, ok = run_codex(context_prompt, reason="session_context_main")
+        reply, ok = run_codex(
+            context_prompt,
+            reason="session_context_main",
+            image_inputs=image_inputs,
+        )
         if ok and (not user_mentions_meta) and contains_meta_noise(reply):
             log("[guard] meta-noise detected in contextual reply; retrying without history", "WARN")
-            retry_reply, retry_ok = run_codex(build_clean_prompt(text), reason="session_clean_retry")
+            retry_reply, retry_ok = run_codex(
+                build_clean_prompt(text, current_media=message_media),
+                reason="session_clean_retry",
+                image_inputs=image_inputs,
+            )
             reply, ok = retry_reply, retry_ok
 
         if ok and (not user_mentions_meta) and contains_generic_nonanswer(reply):
@@ -2607,8 +3508,10 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
                     session_no=session_no,
                     history=history_messages,
                     user_text=text,
+                    current_media=message_media,
                 ),
                 reason="session_strict_retry",
+                image_inputs=image_inputs,
             )
             reply, ok = retry_reply, retry_ok
         if ok and (not user_mentions_meta) and contains_generic_nonanswer(reply):
@@ -2619,18 +3522,20 @@ def process_update(update: dict[str, Any], allowlist: set[str] | None) -> None:
                     session_no=session_no,
                     history=history_messages,
                     user_text=text,
+                    current_media=message_media,
                 ),
                 reason="session_chat_retry",
+                image_inputs=image_inputs,
             )
             reply, ok = retry_reply, retry_ok
 
-    send_text(chat_id, reply)
+    history_reply = send_reply_with_local_files(chat_id, reply)
 
-    append_session_message(session, "user", text)
-    reply_has_meta = contains_meta_noise(reply)
-    reply_is_generic = contains_generic_nonanswer(reply)
+    append_session_message(session, "user", text, media=message_media)
+    reply_has_meta = contains_meta_noise(history_reply)
+    reply_is_generic = contains_generic_nonanswer(history_reply)
     if ok and (user_mentions_meta or (not reply_has_meta and not reply_is_generic)):
-        append_session_message(session, "assistant", reply)
+        append_session_message(session, "assistant", history_reply)
     else:
         log(
             f"[session] assistant reply not persisted key={session_key} "
@@ -2666,10 +3571,7 @@ def main() -> None:
         log(f"[codex] path={startup_path!r}")
     if CODEX_ADD_DIRS:
         log(f"[codex] add_dirs={CODEX_ADD_DIRS}")
-    log(
-        f"[codex] local timeout disabled; waiting for Codex CLI result "
-        f"(codex_timeout_seconds={CODEX_TIMEOUT_SECONDS} ignored)"
-    )
+    log(f"[codex] timeout_seconds={CODEX_TIMEOUT_SECONDS}")
     log(f"[telegram] typing heartbeat interval={TYPING_HEARTBEAT_SECONDS}s")
     log(f"[log] file={LOG_FILE} stdout={LOG_STDOUT} text_preview_chars={TEXT_PREVIEW_CHARS}")
     log(
@@ -2681,6 +3583,17 @@ def main() -> None:
         f"max_messages={SESSION_MAX_MESSAGES} archive_max={SESSION_ARCHIVE_MAX} "
         f"title_max_chars={SESSION_TITLE_MAX_CHARS} "
         f"store={SESSION_STORE_FILE}"
+    )
+    log(
+        f"[media] input_enabled={MEDIA_INPUT_ENABLED} input_dir={MEDIA_INPUT_DIR} "
+        f"input_max_bytes={MEDIA_INPUT_MAX_BYTES} input_max_files={MEDIA_INPUT_MAX_FILES} "
+        f"history_max_items={MEDIA_HISTORY_MAX_ITEMS}"
+    )
+    log(
+        f"[media] local_transcribe_enabled={LOCAL_TRANSCRIBE_ENABLED} "
+        f"model={LOCAL_TRANSCRIBE_MODEL} lang={LOCAL_TRANSCRIBE_LANGUAGE or '(auto)'} "
+        f"device={LOCAL_TRANSCRIBE_DEVICE} compute_type={LOCAL_TRANSCRIBE_COMPUTE_TYPE} "
+        f"vad={LOCAL_TRANSCRIBE_VAD}"
     )
 
     last_allowlist_fingerprint: tuple[str, ...] | None = None

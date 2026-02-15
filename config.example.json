@@ -14,7 +14,25 @@
   "codex_add_dirs": [
     "C:\\Users\\admin\\Desktop"
   ],
+  "file_send_enabled": true,
+  "file_send_dirs": [
+    "C:\\Users\\admin\\Desktop",
+    "workdir"
+  ],
+  "file_send_max_bytes": 52428800,
   "codex_timeout_seconds": 120,
+  "media_input_enabled": true,
+  "media_input_dir": "telegram/uploads",
+  "media_input_max_bytes": 20971520,
+  "media_input_max_files": 4,
+  "media_history_max_items": 4,
+  "local_transcribe_enabled": true,
+  "local_transcribe_model": "tiny",
+  "local_transcribe_language": "zh",
+  "local_transcribe_device": "cpu",
+  "local_transcribe_compute_type": "int8",
+  "local_transcribe_vad": true,
+  "local_transcribe_max_chars": 800,
   "poll_timeout_seconds": 30,
   "log_file": "logs/bot-runtime.log",
   "log_stdout": true,
