@@ -18,6 +18,24 @@ escape_sed() {
   printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
 }
 
+prepend_path_if_missing() {
+  local dir="$1"
+  local path_value="$2"
+  if [[ -z "$dir" ]]; then
+    printf '%s' "$path_value"
+    return
+  fi
+  if [[ ":$path_value:" == *":$dir:"* ]]; then
+    printf '%s' "$path_value"
+    return
+  fi
+  if [[ -n "$path_value" ]]; then
+    printf '%s:%s' "$dir" "$path_value"
+    return
+  fi
+  printf '%s' "$dir"
+}
+
 prompt_non_empty() {
   local prompt="$1"
   local value=""
@@ -43,6 +61,9 @@ install_linux_systemd() {
   local run_user
   local run_group
   local python_bin
+  local codex_bin
+  local node_bin
+  local path_env
   local tmp_file
   local sudo_cmd=""
 
@@ -52,7 +73,16 @@ install_linux_systemd() {
   run_user="$(id -un)"
   run_group="$(id -gn)"
   python_bin="$(command -v python3 || true)"
+  codex_bin="$(command -v codex || true)"
+  node_bin="$(command -v node || true)"
   [[ -n "$python_bin" ]] || { echo "[ERROR] python3 not found in PATH."; exit 1; }
+  path_env="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+  if [[ -n "$codex_bin" ]]; then
+    path_env="$(prepend_path_if_missing "$(dirname "$codex_bin")" "$path_env")"
+  fi
+  if [[ -n "$node_bin" ]]; then
+    path_env="$(prepend_path_if_missing "$(dirname "$node_bin")" "$path_env")"
+  fi
 
   if [[ $EUID -ne 0 ]]; then
     require_cmd sudo
@@ -65,6 +95,7 @@ install_linux_systemd() {
     -e "s|__GROUP__|$(escape_sed "$run_group")|g" \
     -e "s|__ROOT_DIR__|$(escape_sed "$ROOT_DIR")|g" \
     -e "s|__PYTHON_BIN__|$(escape_sed "$python_bin")|g" \
+    -e "s|__PATH_ENV__|$(escape_sed "$path_env")|g" \
     "$template" > "$tmp_file"
 
   $sudo_cmd install -m 644 "$tmp_file" "$target"

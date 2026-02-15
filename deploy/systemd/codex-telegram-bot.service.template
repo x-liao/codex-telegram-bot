@@ -9,6 +9,7 @@ User=__USER__
 Group=__GROUP__
 WorkingDirectory=__ROOT_DIR__
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=__PATH_ENV__
 ExecStart=__PYTHON_BIN__ __ROOT_DIR__/bot.py
 Restart=always
 RestartSec=3

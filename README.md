@@ -152,6 +152,7 @@ User=codexbot
 Group=codexbot
 WorkingDirectory=/opt/codex-telegram-bot
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 /opt/codex-telegram-bot/bot.py
 Restart=always
 RestartSec=3
@@ -185,6 +186,7 @@ sudo systemctl restart codex-telegram-bot.service
 Notes:
 
 - `User`/`Group` must be an account that has run `codex login`.
+- Ensure `PATH` contains both `codex` and `node` locations for this service account.
 - If using a virtual environment, update `ExecStart` to the venv Python path, for example:
   `/opt/codex-telegram-bot/.venv/bin/python /opt/codex-telegram-bot/bot.py`.
 

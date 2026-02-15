@@ -91,6 +91,7 @@ GENERIC_NONANSWER_TOKENS = [
 INSTANCE_LOCK_HELD = False
 DEBUG_ECHO_SEQ = 0
 MODEL_INPUT_PENDING: dict[str, int] = {}
+LOGIN_SHELL_PATH_CACHE: str | None = None
 
 
 class TelegramApiError(RuntimeError):
@@ -400,12 +401,18 @@ TYPING_HEARTBEAT_SECONDS = max(
 
 
 def resolve_codex_bin(bin_name: str) -> str:
+    normalized = (bin_name or "").strip()
+    if not normalized:
+        return "codex"
+
+    expanded = Path(normalized).expanduser()
+
     # 1) Exact path configured
-    if Path(bin_name).exists():
-        return str(Path(bin_name))
+    if expanded.exists() and os.access(expanded, os.X_OK):
+        return str(expanded)
 
     # 2) Resolve from PATH
-    resolved = shutil.which(bin_name)
+    resolved = shutil.which(normalized)
     if resolved:
         return resolved
 
@@ -425,13 +432,90 @@ def resolve_codex_bin(bin_name: str) -> str:
             candidates.append(base / "codex")
 
         for c in candidates:
-            if c.exists():
+            if c.exists() and os.access(c, os.X_OK):
                 return str(c)
+        return normalized
 
-    return bin_name
+    return normalized
 
 
-CODEX_BIN_RESOLVED = resolve_codex_bin(CODEX_BIN)
+def merge_path_values(*values: str) -> str:
+    seen: set[str] = set()
+    items: list[str] = []
+    for raw in values:
+        if not raw:
+            continue
+        for part in raw.split(os.pathsep):
+            p = part.strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            items.append(p)
+    return os.pathsep.join(items)
+
+
+def detect_login_shell_path() -> str:
+    global LOGIN_SHELL_PATH_CACHE
+    if LOGIN_SHELL_PATH_CACHE is not None:
+        return LOGIN_SHELL_PATH_CACHE
+
+    if os.name == "nt":
+        LOGIN_SHELL_PATH_CACHE = ""
+        return ""
+
+    cmd = "printf '%s' \"$PATH\""
+    candidates: list[list[str]] = []
+    shell = os.environ.get("SHELL", "").strip()
+    if shell:
+        candidates.append([shell, "-lc", cmd])
+    candidates.append(["bash", "-lc", cmd])
+    candidates.append(["sh", "-lc", cmd])
+
+    seen: set[tuple[str, str]] = set()
+    for args in candidates:
+        key = (args[0], args[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=2,
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        value = (proc.stdout or "").strip()
+        if value:
+            LOGIN_SHELL_PATH_CACHE = value
+            return value
+
+    LOGIN_SHELL_PATH_CACHE = ""
+    return ""
+
+
+def resolve_codex_runtime(bin_name: str) -> tuple[str, str]:
+    normalized = (bin_name or "").strip() or "codex"
+    base_path = os.environ.get("PATH", "")
+    shell_path = detect_login_shell_path()
+    merged_path = merge_path_values(base_path, shell_path, os.defpath)
+
+    resolved = resolve_codex_bin(normalized)
+    if resolved != normalized:
+        return resolved, merged_path
+
+    if merged_path:
+        fallback = shutil.which(normalized, path=merged_path)
+        if fallback:
+            return fallback, merged_path
+
+    return normalized, merged_path
 
 
 def ensure_parent(path: Path) -> None:
@@ -507,8 +591,9 @@ def validate_codex_model(model: str) -> tuple[bool, str]:
     if not target:
         return False, "模型名不能为空。"
 
+    codex_bin_runtime, runtime_path = resolve_codex_runtime(CODEX_BIN)
     cmd = [
-        CODEX_BIN_RESOLVED,
+        codex_bin_runtime,
         "-a",
         "never",
         "exec",
@@ -530,6 +615,9 @@ def validate_codex_model(model: str) -> tuple[bool, str]:
 
     probe_prompt = "Reply exactly: OK"
     timeout_seconds = max(20, min(120, max(30, CODEX_TIMEOUT_SECONDS)))
+    run_env = os.environ.copy()
+    if runtime_path:
+        run_env["PATH"] = runtime_path
 
     try:
         proc = subprocess.run(
@@ -541,9 +629,10 @@ def validate_codex_model(model: str) -> tuple[bool, str]:
             errors="replace",
             check=False,
             timeout=timeout_seconds,
+            env=run_env,
         )
     except FileNotFoundError:
-        return False, f"Codex 二进制不存在：{CODEX_BIN_RESOLVED}"
+        return False, f"Codex 二进制不存在：{codex_bin_runtime}"
     except subprocess.TimeoutExpired:
         return False, f"验证超时（>{timeout_seconds}s），请稍后重试。"
     except Exception as exc:  # noqa: BLE001
@@ -1850,8 +1939,9 @@ def format_codex_failure_reply(
 
 
 def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
+    codex_bin_runtime, runtime_path = resolve_codex_runtime(CODEX_BIN)
     cmd = [
-        CODEX_BIN_RESOLVED,
+        codex_bin_runtime,
         "-a",
         "never",
         "exec",
@@ -1890,6 +1980,19 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
         "prompt_chars": len(prompt),
         "prompt": clip_debug_text(prompt),
     }
+    run_env = os.environ.copy()
+    if runtime_path:
+        run_env["PATH"] = runtime_path
+    codex_path = Path(codex_bin_runtime).expanduser()
+    codex_dir = codex_path.parent
+    if str(codex_dir) not in {"", "."}:
+        existing_path = run_env.get("PATH", "")
+        path_items = [p for p in existing_path.split(os.pathsep) if p]
+        if str(codex_dir) not in path_items:
+            run_env["PATH"] = (
+                f"{codex_dir}{os.pathsep}{existing_path}" if existing_path else str(codex_dir)
+            )
+
     started_at = time.time()
     try:
         proc = subprocess.run(
@@ -1900,13 +2003,17 @@ def run_codex(prompt: str, reason: str = "primary") -> tuple[str, bool]:
             encoding="utf-8",
             errors="replace",
             check=False,
+            env=run_env,
         )
     except FileNotFoundError:
-        log(f"[codex] binary missing: {CODEX_BIN_RESOLVED}", level="ERROR")
+        path_text = run_env.get("PATH", "")
+        path_preview = path_text if len(path_text) <= 300 else path_text[:300] + "..."
+        log(f"[codex] binary missing: {codex_bin_runtime} path={path_preview!r}", level="ERROR")
         debug_payload["status"] = "binary_missing"
-        debug_payload["error"] = f"Codex binary not found: {CODEX_BIN_RESOLVED}"
+        debug_payload["path"] = path_text
+        debug_payload["error"] = f"Codex binary not found: {codex_bin_runtime}"
         write_codex_debug_echo(debug_payload)
-        return f"Codex binary not found: {CODEX_BIN_RESOLVED}", False
+        return f"Codex binary not found: {codex_bin_runtime}", False
 
     duration_ms = int((time.time() - started_at) * 1000)
     stdout_text = proc.stdout or ""
@@ -2550,10 +2657,13 @@ def main() -> None:
     ensure_telegram_commands()
 
     offset = load_offset()
+    startup_codex_bin, startup_path = resolve_codex_runtime(CODEX_BIN)
     log(f"[telegram] start polling from offset={offset}")
     log(
-        f"[codex] bin={CODEX_BIN_RESOLVED} workdir={CODEX_WORKDIR} sandbox={CODEX_SANDBOX}"
+        f"[codex] bin={startup_codex_bin} workdir={CODEX_WORKDIR} sandbox={CODEX_SANDBOX}"
     )
+    if startup_path:
+        log(f"[codex] path={startup_path!r}")
     if CODEX_ADD_DIRS:
         log(f"[codex] add_dirs={CODEX_ADD_DIRS}")
     log(
@@ -2636,6 +2746,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-

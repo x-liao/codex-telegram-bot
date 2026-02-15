@@ -152,6 +152,7 @@ User=codexbot
 Group=codexbot
 WorkingDirectory=/opt/codex-telegram-bot
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 /opt/codex-telegram-bot/bot.py
 Restart=always
 RestartSec=3
@@ -185,6 +186,7 @@ sudo systemctl restart codex-telegram-bot.service
 说明：
 
 - `User`/`Group` 必须是执行过 `codex login` 的账号。
+- 请确保服务账号的 `PATH` 同时包含 `codex` 与 `node` 所在目录。
 - 如果使用虚拟环境，请把 `ExecStart` 改为虚拟环境 Python 路径，例如：
   `/opt/codex-telegram-bot/.venv/bin/python /opt/codex-telegram-bot/bot.py`。
 
