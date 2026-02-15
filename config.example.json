@@ -1,0 +1,32 @@
+{
+  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "allow_from": [
+    "123456789"
+  ],
+  "codex_bin": "codex",
+  "codex_workdir": "workdir",
+  "codex_sandbox": "danger-full-access",
+  "codex_model": "gpt-5.2-codex",
+  "codex_models": [
+    "gpt-5.2-codex",
+    "gpt-5-codex"
+  ],
+  "codex_add_dirs": [
+    "C:\\Users\\admin\\Desktop"
+  ],
+  "codex_timeout_seconds": 120,
+  "poll_timeout_seconds": 30,
+  "log_file": "logs/bot-runtime.log",
+  "log_stdout": true,
+  "text_preview_chars": 100,
+  "session_enabled": true,
+  "session_scope": "chat",
+  "session_max_messages": 20,
+  "session_archive_max": 10,
+  "session_title_max_chars": 32,
+  "session_entry_max_chars": 2000,
+  "session_system_prompt": "You are a direct and practical Telegram assistant. Handle both normal conversation and coding questions. This is a continuous chat; use prior context when answering the current message.",
+  "debug_echo_enabled": true,
+  "debug_echo_dir": "logs/codex-debug",
+  "debug_echo_max_chars": 0
+}

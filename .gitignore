@@ -1,0 +1,8 @@
+logs/
+config.json
+telegram/*.lock
+telegram/session-store*.json
+telegram/update-offset*.json
+__pycache__/
+*.pyc
+*.pyo
