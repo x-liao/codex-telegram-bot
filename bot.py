@@ -976,7 +976,8 @@ def describe_media_item(item: dict[str, Any]) -> str:
         parts.append(f"mime={mime_type}")
     local_path = str(item.get("local_path", "")).strip()
     if local_path:
-        parts.append(f"path={local_path.replace('\\', '/')}")
+        normalized_local_path = local_path.replace("\\", "/")
+        parts.append(f"path={normalized_local_path}")
     duration = safe_int(item.get("duration"), 0)
     if duration > 0:
         parts.append(f"duration={duration}s")
